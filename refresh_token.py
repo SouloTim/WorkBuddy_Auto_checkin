@@ -146,10 +146,15 @@ def find_auth_file():
         return override if os.path.exists(override) else None
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    support = os.path.join(home, "Library", "Application Support")
     candidates = [
+        # 桌面端实测落点（Windows 与 macOS 一致，仅前缀不同）
         os.path.join(local, "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"),
+        os.path.join(support, "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"),
+        # 兼容早期/非默认位置
         os.path.join(local, "workbuddy-desktop.info"),
-        os.path.join(home, "Library", "Application Support", "workbuddy-desktop.info"),
+        os.path.join(support, "workbuddy-desktop.info"),
+        os.path.join(support, "com.tencent.workbuddy.mac", "workbuddy-desktop.info"),
         os.path.join(home, ".config", "workbuddy-desktop.info"),
         os.path.join(home, ".workbuddy", "auth", "workbuddy-desktop.info"),
     ]
@@ -160,7 +165,7 @@ def find_auth_file():
 
 
 def find_runtime():
-    """定位 WorkBuddy 可执行文件：环境变量 → 常见安装目录 → 注册表。"""
+    """定位 WorkBuddy 可执行文件：环境变量 → 常见安装目录 → 注册表 / App 包。"""
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
         if os.path.isfile(override):
@@ -179,12 +184,45 @@ def find_runtime():
         found = _registry_runtime()
         if found:
             return found
+    for app in _mac_app_candidates():
+        if os.path.isfile(app):
+            return os.path.abspath(app)
     # 兜底：常见非默认安装位置（含本机实测的 D:\WorkBuddy）
     for root in ("C:/", "D:/", "E:/"):
         p = os.path.join(root, "WorkBuddy", "WorkBuddy.exe")
         if os.path.isfile(p):
             return os.path.abspath(p)
     raise SystemExit("未找到 WorkBuddy 客户端，请设置 WORKBUDDY_EXE 环境变量")
+
+
+def _mac_app_candidates():
+    """macOS 上的客户端可执行文件。App 包的主可执行名不固定（本机实测为 Electron），
+    因此优先读 Info.plist 的 CFBundleExecutable，读不到再逐个试常见名字。"""
+    apps = [
+        "/Applications/WorkBuddy.app",
+        os.path.join(os.path.expanduser("~"), "Applications", "WorkBuddy.app"),
+    ]
+    for app in apps:
+        macos_dir = os.path.join(app, "Contents", "MacOS")
+        if not os.path.isdir(macos_dir):
+            continue
+        plist = os.path.join(app, "Contents", "Info.plist")
+        if os.path.isfile(plist):
+            name = _plist_executable(plist)
+            if name and os.path.isfile(os.path.join(macos_dir, name)):
+                yield os.path.join(macos_dir, name)
+        for name in ("WorkBuddy", "Electron"):
+            yield os.path.join(macos_dir, name)
+
+
+def _plist_executable(plist):
+    """只读取 CFBundleExecutable 字符串值；失败返回 None。"""
+    try:
+        import plistlib
+        with open(plist, "rb") as f:
+            return plistlib.load(f).get("CFBundleExecutable")
+    except Exception:
+        return None
 
 
 def _registry_runtime():
@@ -284,6 +322,9 @@ def main():
     if not (isinstance(token, str) and TOKEN_RE.fullmatch(token)):
         raise SystemExit("token 格式异常")
 
+    # 顺带报告到期时间：让用户当场知道下次该在什么时候来刷新
+    exp, left = session_expiry(session)
+
     # 有 gh 且指定了仓库 → 自动写入；否则统一走「指引 + 起止标记 + token」，
     # 保证无论是终端跑 .py 还是双击 exe，输出结构一致、都能照着做
     if gh_repo and shutil.which("gh") is not None:
@@ -296,6 +337,7 @@ def main():
         if proc.returncode != 0:
             raise SystemExit("写入 GitHub Secret 失败：" + proc.stderr.decode("utf-8", "replace"))
         print("已写入 GitHub Secret WB_ACCESS_TOKEN（仓库 %s）" % gh_repo)
+        _print_expiry(exp, left)
         return
 
     if gh_repo:
@@ -313,7 +355,53 @@ def main():
     print("\n----- 以下为 token -----")
     print(token)
     print("----- 以上为 token -----")
+    _print_expiry(exp, left)
     print("\n[安全提醒] token 等同登录态，请勿粘贴到聊天、日志或任何第三方站点。", file=sys.stderr)
+
+
+def _print_expiry(exp, left):
+    if exp is None:
+        return
+    print("\n[到期时间] %s（剩余约 %.1f 天）"
+          % (exp.strftime("%Y-%m-%d %H:%M"), left if left is not None else 0))
+    if left is not None and left <= 7:
+        print("[提醒] 已进入 7 天预警期，建议尽快重跑本脚本覆盖 Secret。")
+
+
+def session_expiry(session):
+    """从凭据文件读 accessToken 到期时间。返回 (到期时间, 剩余天数)；读不到返回 (None, None)。
+
+    优先用 auth.expiresAt（毫秒时间戳，客户端直接落盘），
+    缺失时回退到解析 accessToken（JWT）的 exp 声明。
+    """
+    import datetime
+    auth = session.get("auth", {})
+    exp = None
+    ms = auth.get("expiresAt")
+    if isinstance(ms, (int, float)) and ms > 0:
+        exp = datetime.datetime.fromtimestamp(ms / 1000)
+    else:
+        token = auth.get("accessToken")
+        if isinstance(token, str) and token.count(".") == 2:
+            exp = _jwt_exp(token)
+    if exp is None:
+        return None, None
+    left = (exp - datetime.datetime.now()).total_seconds() / 86400
+    return exp, left
+
+
+def _jwt_exp(token):
+    """解析 JWT 的 exp 声明（本地、离线）；非 JWT 或解析失败返回 None。"""
+    import base64
+    import datetime
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get("exp")
+        return datetime.datetime.fromtimestamp(exp) if isinstance(exp, (int, float)) else None
+    except Exception:
+        return None
 
 
 def _pause_if_frozen():

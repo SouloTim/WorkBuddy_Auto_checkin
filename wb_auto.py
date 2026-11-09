@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推飞书。
+"""wb_auto.py —— 云端 runner 执行的每日自动化：签到 + 派猫猫旅行，结果推送到微信。
 
 设计要点：
   1. 一次运行把签到与派猫都做掉；
   2. 先领已到家的旅行积分，再判断能否派新一趟；今日名额已用则不派；
   3. 签到与猫猫状态分开汇报；
-  4. 猫猫失败不污染签到结论 —— 签到成功即整体成功。
+  4. 猫猫失败不污染签到结论 —— 签到成功即整体成功；
+  5. 顺带检查访问令牌剩余有效期，临近到期时在通知里提醒。
 
 凭证来自 GitHub Secret（由本机 refresh_token.py 注入），只读环境变量，不落盘、不打日志。
+
+推送通道（填哪条推哪条，可多条并存）：
+  WECOM_WEBHOOK       企业微信群机器人
+  SERVERCHAN_SENDKEY  Server酱（个人微信）
+  PUSHPLUS_TOKEN      PushPlus（个人微信）
 """
 
+import base64
+import datetime
 import json
 import os
 import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
@@ -292,83 +301,178 @@ def run_buddy(headers, endpoint):
         return {"result": "ERROR", "report": "猫猫模块异常（%s: %s）" % (type(e).__name__, e), "notes": notes}
 
 
-# ---------------------------------------------------------------- 飞书
+# ---------------------------------------------------------------- 令牌到期提醒
 
-def push_feishu(webhook, title, checkin_line, buddy_line, overall_ok):
-    """推送到飞书自定义机器人。返回 (ok, reason)。
+EXPIRY_WARN_DAYS = 7      # 剩余天数 ≤ 此值 → 进入预警
+EXPIRY_CRITICAL_DAYS = 3  # 剩余天数 ≤ 此值 → 紧急告警
 
-    重试策略与业务请求、WPS 版保持一致：
-      - 网络异常 / HTTP 5xx → 自动重试（最多 MAX_RETRY 次，退避），瞬时故障自愈
-      - 飞书业务拒绝（19001 地址无效、机器人开启签名校验等）→ 不重试（重试无用），
-        原因带改法返回，写入结果供 step summary 展示
-    兜底：脚本幂等，当天 cron 有多个时段时，下一次运行会自动再推一遍当天结果。
-    """
-    color = "green" if overall_ok else "red"
-    lines = [
-        "**%s**" % title,
-        "",
-        "**签到**",
-        checkin_line,
-        "",
-        "**猫猫旅行**",
-        buddy_line,
-    ]
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {
-                "template": color,
-                "title": {"tag": "plain_text",
-                          "content": "Buddy 加油站 · %s" % ("成功" if overall_ok else "部分失败")},
-            },
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
-        },
-    }
+
+def decode_jwt_claims(token):
+    """本地解析 JWT 的载荷（不验签、不联网）。失败返回 {}。"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def token_expiry(token):
+    """返回 (到期 datetime, 剩余天数)；无法解析返回 (None, None)。"""
+    exp = decode_jwt_claims(token).get("exp")
+    if not isinstance(exp, (int, float)):
+        return None, None
+    expire = datetime.datetime.fromtimestamp(exp)
+    left = (expire - datetime.datetime.now()).total_seconds() / 86400
+    return expire, left
+
+
+def expiry_line(token):
+    """生成给人看的一行到期提醒文案；解析不出时返回 None（不臆造）。"""
+    expire, left = token_expiry(token)
+    if expire is None:
+        return None
+    date = expire.strftime("%Y-%m-%d")
+    if left <= 0:
+        return "🔴 访问令牌已过期（%s），签到会失败，请立即重跑 refresh_token.py 重新注入" % date
+    if left <= EXPIRY_CRITICAL_DAYS:
+        return "🔴 访问令牌 %s 到期，仅剩 %.1f 天，请尽快重跑 refresh_token.py 重新注入" % (date, left)
+    if left <= EXPIRY_WARN_DAYS:
+        return "🟡 访问令牌 %s 到期，剩 %.1f 天，建议近日重跑 refresh_token.py 重新注入" % (date, left)
+    return "✅ 访问令牌有效期至 %s（剩 %.0f 天）" % (date, left)
+
+
+# ---------------------------------------------------------------- 推送
+#
+# 三条通道，填了哪条就推哪条（可同时启用多条）：
+#   WECOM_WEBHOOK     企业微信群机器人          官方 webhook，最稳
+#   SERVERCHAN_SENDKEY Server酱（个人微信）      第三方中转，SCT 开头
+#   PUSHPLUS_TOKEN    PushPlus（个人微信）       第三方中转
+# 任一通道失败都只记录原因，不影响签到结论；当天多时段 cron 会自然重推。
+
+def _http_post_json(url, payload, headers=None):
     data = json.dumps(payload).encode("utf-8")
-    attempt = 0
-    while True:
-        attempt += 1
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers=headers or {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
+        return getattr(resp, "status", 200), json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _http_post_form(url, fields):
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
+        return getattr(resp, "status", 200), json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def send_wecom(webhook, text):
+    """企业微信群机器人。返回 (ok, reason)。"""
+    try:
+        _, body = _http_post_json(webhook, {"msgtype": "text", "text": {"content": text}})
+    except urllib.error.HTTPError as e:
+        return False, "企业微信 HTTP %s" % e.code
+    except Exception as e:
+        return False, "企业微信请求异常：%s: %s" % (type(e).__name__, e)
+    if body.get("errcode") == 0:
+        return True, ""
+    return False, "企业微信返回 errcode=%s %s（92001/webhook 无效多为地址不完整）" % (
+        body.get("errcode", "未知"), body.get("errmsg", ""))
+
+
+def send_serverchan(sendkey, text):
+    """Server酱（个人微信推送）。返回 (ok, reason)。"""
+    is_sct = sendkey.startswith("sct")
+    if is_sct:
+        url = "https://sctapi.ftqq.com/%s.send" % sendkey
         try:
-            req = urllib.request.Request(webhook, data=data, method="POST",
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
-                body = json.loads(resp.read().decode("utf-8", "replace"))
-                log("  [飞书] HTTP %s %s" % (resp.status, json.dumps(body, ensure_ascii=False)))
-                if body.get("code") == 0:
-                    return True, ""
-                return False, ("飞书返回码 %s（19001 多为地址不对；机器人若开了签名校验也会失败。"
-                               "这是配置问题，重试无用：检查 Secret FEISHU_WEBHOOK，或建机器人时"
-                               "不要勾选签名校验）" % body.get("code", "未知"))
+            _, body = _http_post_form(url, {"title": "WorkBuddy 每日自动化", "desp": text})
         except urllib.error.HTTPError as e:
-            if e.code >= 500 and attempt < MAX_RETRY:
-                log("  [飞书] HTTP %s，退避后重试（%d/%d）" % (e.code, attempt, MAX_RETRY))
-                time.sleep(2.0 * attempt)
-                continue
-            if e.code >= 500:
-                return False, "重试 %d 次后仍 HTTP %s" % (MAX_RETRY, e.code)
-            return False, "HTTP %s" % e.code
+            return False, "Server酱 HTTP %s" % e.code
         except Exception as e:
-            if attempt < MAX_RETRY:
-                log("  [飞书] 请求异常，退避后重试（%d/%d）：%s: %s"
-                    % (attempt, MAX_RETRY, type(e).__name__, e))
-                time.sleep(2.0 * attempt)
-                continue
-            return False, "重试 %d 次后仍异常：%s: %s" % (MAX_RETRY, type(e).__name__, e)
+            return False, "Server酱请求异常：%s: %s" % (type(e).__name__, e)
+        if body.get("code") == 0:
+            return True, ""
+        return False, "Server酱返回 code=%s %s" % (body.get("code", "未知"), body.get("message", ""))
+    # 兼容旧版 SCKEY：GET 调用
+    url = "https://sc.ftqq.com/%s.send?text=%s" % (sendkey, urllib.parse.quote("WorkBuddy 每日自动化"))
+    try:
+        with urllib.request.urlopen(url, timeout=15, context=ssl.create_default_context()) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return False, "Server酱(旧版) HTTP %s" % e.code
+    except Exception as e:
+        return False, "Server酱(旧版)请求异常：%s: %s" % (type(e).__name__, e)
+    if body.get("errno") == 0:
+        return True, ""
+    return False, "Server酱(旧版)返回 errno=%s %s" % (body.get("errno", "未知"), body.get("errmsg", ""))
+
+
+def send_pushplus(token, text):
+    """PushPlus（个人微信推送）。返回 (ok, reason)。"""
+    try:
+        _, body = _http_post_json("https://www.pushplus.plus/send",
+                                  {"token": token, "title": "WorkBuddy 每日自动化",
+                                   "content": text, "template": "txt"})
+    except urllib.error.HTTPError as e:
+        return False, "PushPlus HTTP %s" % e.code
+    except Exception as e:
+        return False, "PushPlus请求异常：%s: %s" % (type(e).__name__, e)
+    if body.get("code") == 200:
+        return True, ""
+    return False, "PushPlus返回 code=%s %s" % (body.get("code", "未知"), body.get("msg", ""))
+
+
+def build_message(title, checkin_line, buddy_line, expiry, overall_ok):
+    lines = [
+        "【%s】%s" % (title, "签到成功" if overall_ok else "签到未达成"),
+        "",
+        "签到：%s" % checkin_line,
+        "猫猫：%s" % buddy_line,
+    ]
+    if expiry:
+        lines += ["", "令牌：%s" % expiry]
+    return "\n".join(lines)
+
+
+def push_all(channels, text):
+    """按配置推送所有通道，返回 [{name, ok, reason}]。"""
+    results = []
+    for name, send in channels:
+        try:
+            ok, reason = send(text)
+        except Exception as e:
+            ok, reason = False, "%s: %s" % (type(e).__name__, e)
+        log("  [%s] %s%s" % (name, "成功" if ok else "失败", "" if ok else "：" + str(reason)))
+        results.append({"name": name, "ok": ok, "reason": reason})
+    return results
 
 
 # ---------------------------------------------------------------- 主流程
 
 def main():
     token = os.environ.get("WB_ACCESS_TOKEN")
-    webhook = os.environ.get("FEISHU_WEBHOOK")
     endpoint = os.environ.get("WB_ENDPOINT") or DEFAULT_ENDPOINT
+
+    # 推送通道：填了哪条就推哪条，可同时启用多条
+    channels = []
+    if os.environ.get("WECOM_WEBHOOK"):
+        channels.append(("企业微信", lambda t: send_wecom(os.environ["WECOM_WEBHOOK"], t)))
+    if os.environ.get("SERVERCHAN_SENDKEY"):
+        channels.append(("Server酱", lambda t: send_serverchan(os.environ["SERVERCHAN_SENDKEY"], t)))
+    if os.environ.get("PUSHPLUS_TOKEN"):
+        channels.append(("PushPlus", lambda t: send_pushplus(os.environ["PUSHPLUS_TOKEN"], t)))
 
     if not token:
         log("缺少环境变量 WB_ACCESS_TOKEN（请在本机运行 refresh_token.py 注入 GitHub Secret）")
         return 2
-    if not webhook:
-        log("缺少环境变量 FEISHU_WEBHOOK")
+    if not channels:
+        log("未配置任何推送通道（WECOM_WEBHOOK / SERVERCHAN_SENDKEY / PUSHPLUS_TOKEN），本次仅打印日志")
 
     headers = {
         "Accept": "application/json",
@@ -394,15 +498,25 @@ def main():
     checkin_line = ("✅ " if checkin_ok else "❌ ") + checkin["report"]
     buddy_line = ("🐱 " + buddy.get("report", "")) if buddy.get("report") else "🐱 无结论"
 
-    # 推送状态与业务结论分开呈现：失败原因可诊断，但不污染签到结论
-    push_ok, push_reason = None, "未配置（缺少 FEISHU_WEBHOOK，本次不推送）"
-    if webhook:
-        push_ok, push_reason = push_feishu(webhook, "每日自动化", checkin_line, buddy_line, overall_ok)
+    # 令牌到期提醒：本地解析 JWT 的 exp，不需要额外 Secret
+    expiry = expiry_line(token)
+    if expiry:
+        log("  [令牌] %s" % expiry)
+
+    # 推送
+    message = build_message("WorkBuddy 每日自动化", checkin_line, buddy_line, expiry, overall_ok)
+    log("=== 推送 ===")
+    if channels:
+        pushes = push_all(channels, message)
+    else:
+        pushes = []
+        log("  · 无推送通道，跳过")
 
     result = {
         "checkin": {"ok": checkin_ok, **checkin},
         "buddy": {k: v for k, v in buddy.items() if k != "notes"},
-        "push": {"ok": push_ok, "reason": push_reason},
+        "expiry": expiry,
+        "push": pushes,
         "overall_ok": overall_ok,
     }
     print("RESULT_JSON " + json.dumps(result, ensure_ascii=False))
@@ -411,13 +525,18 @@ def main():
     result_file = os.environ.get("WB_RESULT_FILE")
     if result_file:
         try:
-            push_line = ("✅ 已推送到飞书" if push_ok
-                         else "❌ 推送失败：%s" % push_reason)
+            if not channels:
+                push_line = "未配置推送通道"
+            else:
+                push_line = "；".join(
+                    "%s%s" % (p["name"], "✅" if p["ok"] else "❌ " + str(p["reason"]))
+                    for p in pushes)
             with open(result_file, "w", encoding="utf-8") as f:
                 f.write("| 项目 | 结论 |\n| --- | --- |\n")
                 f.write("| 签到 | %s |\n" % checkin_line)
                 f.write("| 猫猫旅行 | %s |\n" % buddy_line)
-                f.write("| 飞书推送 | %s |\n" % push_line)
+                f.write("| 令牌有效期 | %s |\n" % (expiry or "无法解析"))
+                f.write("| 推送 | %s |\n" % push_line)
                 f.write("| 整体 | %s |\n" % ("成功（签到已达成）" if overall_ok else "失败（签到未达成）"))
         except OSError as e:
             log("结果文件写入失败：%s" % e)

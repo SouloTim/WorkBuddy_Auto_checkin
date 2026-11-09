@@ -1,6 +1,6 @@
 # workbuddy_auto_checkin
 
-WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派猫猫旅行并领回礼物**，结果推送到飞书。
+WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派猫猫旅行并领回礼物**，结果推送到**微信**（企业微信群机器人 / Server酱 / PushPlus，三选一或全开），并**在访问令牌临近过期时提前提醒**。
 
 跑在 GitHub Actions 上，按 cron 每天定时执行，不需要任何常开设备。
 
@@ -10,12 +10,11 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 > | --- | --- | --- |
 > | 适合 | 习惯 GitHub 的用户 | **不想碰 GitHub / 零命令行** 的用户 |
 > | 托管 | GitHub Actions 免费定时任务 | 金山文档智能表格脚本 + 免费定时任务 |
-> | 配置 | Fork 仓库 + 填两个 Secret | 建表格 → 粘脚本 → 填两个单元格 |
-> | 结果 | Actions 日志 / 飞书卡片 | 直接回写表格 / 飞书卡片 |
+> | 配置 | Fork 仓库 + 填 Secret | 建表格 → 粘脚本 → 填单元格 |
+> | 结果 | Actions 日志 / 微信消息 | 直接回写表格 |
 >
-> 两种版本的 token 都由本机导出一次（[第 4 步](#第-4-步导出登录凭证二选一)）：
-> 装了 Python 就跑 `refresh_token.py`；没装 Python 直接下载仓库里的
-> **`refresh_token.exe`** 双击运行，无需任何环境。
+> 两种版本的 token 都由本机导出一次（[第 4 步](#第-4-步导出登录凭证二选一)）。
+> 本机导出脚本在 **Windows 与 macOS** 上均可直接运行（已适配两端的路径探测）。
 
 ## 特性
 
@@ -23,25 +22,30 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 - **一次做两件事** — 签到与成长中心旅行在同一次运行里完成
 - **幂等** — 先查状态再决定是否领取；已签不重领，已派不重派
 - **结论解耦** — 猫猫模块任何异常都不影响签到结论；整体成败只看签到
+- **令牌到期预警** — 每次运行顺带检查 token 剩余有效期，剩 7 天转黄、3 天转红，直接写进通知
 - **零明文入库** — 仓库不含任何凭据；token 由本机脚本导出后写入 GitHub Secret
+- **推送到微信** — 企业微信群机器人 / Server酱 / PushPlus 三条通道任选，填了哪条推哪条
 
 ## 工作原理
 
 ```text
-本机（一次性）                      GitHub                           外部
-┌──────────────────┐    gh secret   ┌────────────────────┐
-│ refresh_token.py │ ─────────────► │ Secret:            │
-│  读登录态 → 解密 │                │  WB_ACCESS_TOKEN   │
-└──────────────────┘                │  FEISHU_WEBHOOK    │
-                                    └─────────┬──────────┘
+本机（一次性）                      GitHub                        外部
+┌──────────────────┐   gh secret   ┌─────────────────────┐
+│ refresh_token.py │ ─────────────► │ Secret:             │
+│  读登录态 → 解密 │                │  WB_ACCESS_TOKEN    │
+└──────────────────┘                │  WECOM_WEBHOOK      │
+                                    │  /SERVERCHAN_SENDKEY│
+                                    │  /PUSHPLUS_TOKEN    │
+                                    └─────────┬───────────┘
                                               │ 每天 cron
                                     ┌─────────▼──────────┐        ┌──────────────┐
                                     │ Actions: wb_auto.py│ ─────► │ copilot.     │
-                                    │  签到 / 领奖 / 派出│ ◄───── │ tencent.com  │
-                                    └─────────┬──────────┘        └──────────────┘
-                                              │ webhook
+                                    │  签到/领奖/派出     │ ◄───── │ tencent.com  │
+                                    │  令牌到期检查       │        └──────────────┘
+                                    └─────────┬──────────┘
+                                              │ 推送
                                     ┌─────────▼──────────┐
-                                    │ 飞书群机器人卡片    │
+                                    │ 企业微信 / 个人微信 │
                                     └────────────────────┘
 ```
 
@@ -57,8 +61,8 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 
 - 一个 GitHub 账号
 - 一台装过 WorkBuddy **并且登录过**的电脑（只在配置时用一次）
-- 一个飞书群（自己建一个只有自己的也行），用来收消息
-- 电脑上有 Python 3.8+（没有也行——用仓库里的 `refresh_token.exe`，见第 4 步）
+- **一个接收消息的微信通道**（三选一，见 [第 3 步](#第-3 步接一个微信推送通道三选一)）
+- 电脑上有 Python 3.8+（Windows 用户没有也行——可用仓库里的 `refresh_token.exe`，见第 4 步）
 
 ### 容易搞混的一点，先说清楚
 
@@ -90,18 +94,42 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 - 网页下载：你的仓库页 → 绿色 **Code** 按钮 → **Download ZIP** → 解压
 - 或用 git：`git clone https://github.com/FXmonkey/workbuddy_auto_checkin.git`
 
-### 第 3 步：拿一个飞书机器人地址
+### 第 3 步：接一个微信推送通道（三选一）
 
-1. 在飞书里建一个群（只有你自己也行）
-2. 群设置 → **群机器人** → **添加机器人** → **自定义机器人**
-3. 复制它给你的地址，形如 `https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`
+三条通道**互相独立**，填哪条就推哪条，也可以同时填多条一起推。按你手上的条件挑一条即可：
+
+| 通道 | 适合谁 | 你需要的 | 对应 Secret |
+| --- | --- | --- | --- |
+| **企业微信群机器人** | 有企业微信 | 群机器人 webhook 地址 | `WECOM_WEBHOOK` |
+| **Server酱** | 只有个人微信 | SendKey（`SCT` 开头） | `SERVERCHAN_SENDKEY` |
+| **PushPlus** | 只有个人微信 | token | `PUSHPLUS_TOKEN` |
+
+**方案 1：企业微信群机器人（若你所在组织能用企业微信，最稳）**
+
+1. 企业微信里建一个群（只有自己也行）→ 群设置 → **群机器人** → **添加机器人**
+2. 复制它给出的 Webhook 地址，形如
+   `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx`
+
+**方案 2：Server酱（推送到个人微信）**
+
+1. 打开 `https://sct.ftqq.com/`，用微信扫码登录
+2. 在「SendKey」页复制你的 SendKey（形如 `SCTxxxxxxxx`），并按其指引关注服务号完成绑定
+
+**方案 3：PushPlus（推送到个人微信）**
+
+1. 打开 `https://www.pushplus.plus/`，微信扫码登录
+2. 首页复制你的 `token`
+
+> 三条通道都是纯文本消息，签到结论与令牌到期提醒会一起发过去。
+
+> ⚠️ WPS 金山文档版不使用以上通道，它直接回写表格，见 [wps/README.md](wps/README.md)。
 
 ### 第 4 步：导出登录凭证（二选一）
 
 **先选运行形式：**
 
-- **没装 Python？** 直接双击仓库里的 **`refresh_token.exe`**（用法与 `.py` 完全一致，把下面命令里的 `python refresh_token.py` 换成 `refresh_token.exe` 即可）。首次运行 Windows SmartScreen 可能拦截，点 **更多信息 → 仍要运行**。
-- 装了 Python：继续往下按命令操作（脚本零第三方依赖，只需 Python 3.8+）。
+- **没装 Python（仅 Windows）？** 直接双击仓库里的 **`refresh_token.exe`**（用法与 `.py` 完全一致，把下面命令里的 `python refresh_token.py` 换成 `refresh_token.exe` 即可）。首次运行 Windows SmartScreen 可能拦截，点 **更多信息 → 仍要运行**。
+- **装了 Python（Windows / macOS 均可）**：继续往下按命令操作（脚本零第三方依赖，只需 Python 3.8+）。
 
 **方式 A：电脑上装了 gh CLI —— 自动写入，最省事**
 
@@ -121,36 +149,60 @@ python refresh_token.py --gh-repo 你的用户名/workbuddy_auto_checkin
 python refresh_token.py
 ```
 
-屏幕上会打印一长串字符（下图涂黑的部分就是它），**完整复制 `----- 以下为 token -----` 到 `----- 以上为 token -----` 之间**的内容，下一步手动粘进 GitHub。
+屏幕上会打印一长串字符（下图涂黑的部分就是它），**完整复制 `----- 以下为 token -----` 到 `----- 以上为 token -----` 之间**的内容，下一步手动粘进 GitHub。脚本末尾还会打印 **[到期时间]**，记下这个日期，接近时再跑一次即可。
+
+> **macOS 用户**：凭据文件通常在
+> `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`，
+> 脚本已内置该路径，直接运行即可；若提示未找到，用
+> `WORKBUDDY_AUTH_FILE` / `WORKBUDDY_EXE` 指定后重试。
 
 ![](assets/refresh_token输出.jpg)
 
 
 
-### 第 5 步：把两个 Secret 填进仓库
+### 第 5 步：把 Secret 填进仓库
 
 打开**你自己的仓库** → **Settings** → 左侧 **Secrets and variables** → **Actions** → 点绿色的 **New repository secret**：
 
 ![](assets/github_配置action的飞书、wb_access_token.png)
 
-需要填两条：
+需要填的 Secret：
 
-| Name | Secret 里填什么 |
-| --- | --- |
-| `WB_ACCESS_TOKEN` | 第 4 步方式 B 复制的那串字符 |
-| `FEISHU_WEBHOOK` | 第 3 步拿到的飞书机器人地址 |
+| Name | 必填 | Secret 里填什么 |
+| --- | --- | --- |
+| `WB_ACCESS_TOKEN` | **是** | 第 4 步方式 B 复制的那串字符 |
+| `WECOM_WEBHOOK` | 三选一 | 第 3 步方案 1 的企业微信机器人地址 |
+| `SERVERCHAN_SENDKEY` | 三选一 | 第 3 步方案 2 的 Server酱 SendKey |
+| `PUSHPLUS_TOKEN` | 三选一 | 第 3 步方案 3 的 PushPlus token |
 
-> 方式 A 已经自动写入 `WB_ACCESS_TOKEN` 的，这里只需要再填 `FEISHU_WEBHOOK` 一条。
-> 填完这个页面应该能看到两条记录（如上面截图所示）。
+> 方式 A 已经自动写入 `WB_ACCESS_TOKEN` 的，这里只需再填**一条**推送通道的 Secret。
+> 推送通道的 Secret 至少要填一个，否则脚本只打日志、不推送。
+> 填完后这个页面应该能看到相应数量的记录（如上面截图所示）。
 
 ### 第 6 步：手动跑一次验证
 
 1. 打开你的仓库 → 点上方 **Actions** 页签
 2. 左侧选 **Buddy 加油站每日自动化**
 3. 右侧点 **Run workflow** 下拉，再点绿色的 **Run workflow**
-4. 等十几秒，刷新页面，飞书应该收到一条消息
+4. 等十几秒，刷新页面，微信应该收到一条消息
 
-> 这个页面显示绿色不代表签到一定成功（猫猫出问题不影响整体结论）。**以飞书收到的消息为准。**
+> 这个页面显示绿色不代表签到一定成功（猫猫出问题不影响整体结论）。**以微信收到的消息为准。**
+
+## 令牌到期提醒
+
+访问令牌由客户端签发，**有效期 30 天**（凭据文件 `expiresIn` = `2592000` 秒，`refreshToken` 有效期 60 天）。token 是标准 JWT，脚本在每次运行时**本地解析其 `exp` 声明**得知剩余天数，无需额外配置任何 Secret，也不会把 token 发去任何第三方。
+
+提醒分四档，直接写进每次推送的消息里：
+
+| 剩余天数 | 提示 |
+| --- | --- |
+| > 7 天 | ✅ 访问令牌有效期至 YYYY-MM-DD（剩 N 天） |
+| ≤ 7 天 | 🟡 …剩 N 天，建议近日重跑 `refresh_token.py` 重新注入 |
+| ≤ 3 天 | 🔴 …仅剩 N 天，请尽快重跑 `refresh_token.py` 重新注入 |
+| 已过期 | 🔴 访问令牌已过期，签到会失败，请立即重跑 `refresh_token.py` |
+
+> 因此**你不需要自己记日子**：只要 cron 在跑，临近到期时会连续多天收到黄色/红色提醒。
+> 收到提醒后在装有 WorkBuddy 的电脑上重跑一次导出脚本、覆盖 `WB_ACCESS_TOKEN` 即可。
 
 ## 配置项
 
@@ -159,9 +211,13 @@ python refresh_token.py
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `WB_ACCESS_TOKEN` | 是 | — | 访问令牌。缺失则直接退出（exit 2） |
-| `FEISHU_WEBHOOK` | 建议 | — | 飞书自定义机器人地址。缺失则不推送，仅打印日志 |
+| `WECOM_WEBHOOK` | 三选一 | — | 企业微信群机器人 webhook。填了即启用该通道 |
+| `SERVERCHAN_SENDKEY` | 三选一 | — | Server酱 SendKey（`SCT` 开头）。填了即启用该通道 |
+| `PUSHPLUS_TOKEN` | 三选一 | — | PushPlus token。填了即启用该通道 |
 | `WB_ENDPOINT` | 否 | `https://copilot.tencent.com` | 接口地址 |
 | `WB_RESULT_FILE` | 否 | — | 写入 Markdown 汇总表，供 Actions 的 step summary 使用 |
+
+> 三条推送通道互相独立，**填了几条就推几条**；一条都没填则只打印日志、不推送。
 
 ### 本机侧（`refresh_token.py`）
 
@@ -170,7 +226,15 @@ python refresh_token.py
 | `WORKBUDDY_AUTH_FILE` | 覆盖凭据文件路径。用于非默认安装或凭据位置变动 |
 | `WORKBUDDY_EXE` | 覆盖客户端可执行文件路径。自动探测失败时使用 |
 
-凭据文件按 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info` 探测；客户端按 `WORKBUDDY_EXE` → `%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe` → 常见盘根目录 → 注册表 `DisplayIcon` 的顺序探测。
+**凭据文件**按以下顺序探测（Windows / macOS 均已适配）：
+
+```text
+Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
+macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
+```
+
+**客户端可执行文件**按 `WORKBUDDY_EXE` → 常见安装目录 → 注册表 `DisplayIcon`（Windows）→
+`/Applications/WorkBuddy.app`（macOS，读 `Info.plist` 的 `CFBundleExecutable`）的顺序探测。
 
 ## 行为矩阵
 
@@ -188,6 +252,8 @@ python refresh_token.py
 | 猫猫模块异常 | 捕获后单独汇报，不影响签到 | `ERROR` |
 | 旅行状态取值未知 | 原样汇报，不做写操作 | `UNKNOWN_STATE` |
 | 领取返回无法识别 | 汇报原始返回，不臆断成功 | `UNKNOWN` |
+| 令牌剩余 ≤ 7 天 | 在推送正文追加黄色提醒 | — |
+| 令牌剩余 ≤ 3 天 / 已过期 | 在推送正文追加红色提醒 | — |
 
 派出名额的判断读服务端下发的 `daily_limit_reached`，而不是硬撞 `depart` 接口等它报错。
 
@@ -199,7 +265,7 @@ python refresh_token.py
 | `1` | 签到未达成（猫猫失败不在此列） |
 | `2` | 缺少 `WB_ACCESS_TOKEN` |
 
-workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与飞书卡片为准**。
+workflow 中脚本以 `exit 0` 收尾，只对未完成项发 `::warning::`，因此一次运行显示绿色不代表签到一定成功——**以日志、step summary 与微信消息为准**。
 
 ## 接口
 
@@ -220,15 +286,16 @@ POST /v2/activity/growth/buddy/travel/depart     派出一趟
 ## 项目结构
 
 ```text
-wb_auto.py                    云端执行主体：签到、领奖、派出、推送
-refresh_token.py              本机一次性操作：导出 token / 写入 Secret
+wb_auto.py                    云端执行主体：签到、领奖、派出、令牌到期检查、推送微信
+refresh_token.py              本机一次性操作：导出 token / 写入 Secret（Windows + macOS）
 refresh_token.exe             上者的免 Python 打包版（Windows x64，双击即用）
 .github/workflows/daily.yml   cron 定义与执行步骤
 wps/                          WPS 金山文档版（脚本 + 说明，见 wps/README.md）
 ```
 
 > `refresh_token.exe` 由 `refresh_token.py` 经 PyInstaller 打包（零第三方依赖），
-> 每次改动 `.py` 后需要重新构建。未做代码签名，SmartScreen 的提示属正常现象。
+> 每次改动 `.py` 后需要重新构建，仅 Windows 需要。未做代码签名，SmartScreen 的提示属正常现象。
+> **macOS 无需 exe**：直接用 `python3 refresh_token.py` 即可。
 
 ## 安全设计
 
@@ -240,16 +307,29 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 
 ## 常见问题
 
-**令牌过期** — token 由客户端签发，有效期约 28 天（`expiresIn` 2419200）。日志或飞书出现「认证被拒」时，本机重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。
+**令牌过期、或收到黄/红到期提醒** — token 由客户端签发，**有效期 30 天**（`expiresIn` = `2592000` 秒；`refreshToken` 为 60 天）。每次运行都会在推送里带一行到期状态，剩 7 天转黄、3 天转红，不必自己记日子。需要刷新时，在装有 WorkBuddy 的电脑上重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；Windows exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。若日志出现「认证被拒」，同样适用。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 
 **Actions 页签看不到 workflow** — 确认 `.github/workflows/daily.yml` 已入库，且仓库的 Actions 功能未被禁用。
 
-**飞书没收到卡片** — 网络异常与 5xx 会自动重试 3 次；仍失败时看日志中 `[飞书]` 行的原因：
-`19001` 表示 webhook 地址无效或复制不完整（检查 Secret `FEISHU_WEBHOOK`）；机器人若开启了
-**签名校验**，推送会被拒（重试无用），建机器人时不要勾选。当天 cron 有三个时段，某次失败
-后下一次运行会自动再推一遍当天结果（脚本幂等，不会重复领）。
+**微信没收到消息** — 按通道类型对照日志与下方原因排查：
+
+| 通道 | 日志行 | 典型失败原因 |
+| --- | --- | --- |
+| 企业微信 | `[企业微信]` | `errcode=93000/92001` → webhook 地址无效或复制不完整，检查 Secret `WECOM_WEBHOOK` |
+| Server酱 | `[Server酱]` | `code!=0` → SendKey 有误；确认已在 sct.ftqq.com 完成服务号绑定 |
+| PushPlus | `[PushPlus]` | `code!=200` → token 有误；确认已在 pushplus.plus 登录并关注公众号 |
+
+当天 cron 有三个时段，某次失败后下一次运行会自动再推一遍当天结果（脚本幂等，不会重复领）。
+
+**macOS 上提示「未找到凭据文件 / 未找到 WorkBuddy 客户端」** — 客户端版本或安装位置不同时，用环境变量显式指定：
+
+```bash
+WORKBUDDY_AUTH_FILE="$HOME/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info" \
+WORKBUDDY_EXE="/Applications/WorkBuddy.app/Contents/MacOS/Electron" \
+python3 refresh_token.py
+```
 
 **偶发 302** — 高频轮询旅行状态时网关会短暂跳转，请求层已对 3xx 退避重试。按日频执行不会触发。
 

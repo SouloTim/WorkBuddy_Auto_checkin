@@ -237,10 +237,17 @@ GitHub Actions 的云端 runner 既读不到也解不开。因此续期动作必
 ### 一次性配置（macOS）
 
 1. 创建**细粒度 PAT**：https://github.com/settings/personal-access-tokens
-   - **Repository access**：只选本仓库
-   - **Repository permissions**：`Secrets` → **Read and write**（写 Secret 必需；
-     `Contents` 不是必需项）
-   - 有效期选最长（GitHub 上限 1 年）
+   - **仓库访问（Repository access）**：必须选「仅选定的仓库」并勾本仓库。
+     选「公共仓库」时页面**不会出现仓库权限区块**，后面的 `Secrets` / `Contents` 根本无处可配
+   - **仓库权限（Repository permissions）**（注意是「仓库」不是「账户」，
+     点开下拉看标题必须是「选择仓库权限」）：
+     - `Secrets`（中文界面显示为「**机密**」）→ **Read and write**，写 Secret 必需。
+       别误选「代码空间机密 / Codespaces secrets」，那是两套东西，勾了照样 403
+     - `Contents`（中文「内容」）→ **Read and write**。日常令牌同步用不到，
+       只用于把脚本和文档 `git push` 到仓库
+     - `Metadata`（中文「元数据」）只读，系统自带，保留即可
+   - 有效期选最长（GitHub 上限 1 年）；改完点「**更新**」，**不要点「重新生成令牌」**，
+     否则 token 字符串会变、本机存的 PAT 作废
 2. 存到本机（脚本会检查权限，过宽则拒绝运行）：
 
    ```bash
@@ -255,10 +262,19 @@ GitHub Actions 的云端 runner 既读不到也解不开。因此续期动作必
    sed "s#__HOME__#$HOME#g" tools/token_sync.plist.template \
      > ~/Library/LaunchAgents/com.soulo.wb-token-sync.plist
    launchctl load ~/Library/LaunchAgents/com.soulo.wb-token-sync.plist
+   # 若报 Bootstrap failed: 5: Input/output error，改用：
+   # launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.soulo.wb-token-sync.plist
+   launchctl list | grep com.soulo.wb-token-sync   # 确认已注册
    ```
 
    每天 09:00 执行，并在每次登录后补跑一次（覆盖关机期间错过的同步）。
    脚本依赖 `gh` CLI（默认 `/opt/homebrew/bin/gh`），路径不同时改脚本里的 `GH` 常量。
+
+   > **实测坑（2026-11-09）**：`launchctl` 要在 **macOS 自带「终端」App 里手动执行**。
+   > 从某些自动化助手 / 后台服务进程调用会返回 `Bootstrap failed: 5: Input/output error`，
+   > 用通过 `plutil -lint` 的极简测试 plist 也能复现，与 plist 内容无关。
+   > plist 只要放在 `~/Library/LaunchAgents/`，**下次登录系统时 launchd 会自动加载**，
+   > 所以暂时不手动执行也不会永久漏掉。
 
 4. 验证：
 
@@ -279,7 +295,8 @@ GitHub Actions 的云端 runner 既读不到也解不开。因此续期动作必
 
 ### 安全与边界
 
-- PAT **只授权单仓库的 Secrets 读写**，不要给其它权限、不要提交进仓库；
+- PAT **只授权单仓库**，权限仅 `Secrets` 读写（必需）+ `Contents` 读写（推送代码用），
+  不要给其它权限、不要提交进仓库；
   撤销入口：GitHub → Settings → Developer settings → Personal access tokens → Revoke
 - `~/.workbuddy/token_sync/` 为 700、`gh_pat` 为 600；PAT 与 token 都不出现在
   命令行参数里（避免被 `ps` / shell 历史记录）

@@ -106,9 +106,12 @@ WorkBuddy「Buddy 加油站」的每日自动化：**签到领积分**、**派�
 
 **方案 1：企业微信群机器人（若你所在组织能用企业微信，最稳）**
 
-1. 企业微信里建一个群（只有自己也行）→ 群设置 → **群机器人** → **添加机器人**
+1. 企业微信里建一个**内部群**（只有自己也行；若客户端要求至少 3 人，先拉人建群再把其他人移出）→ 群设置 → **群机器人**（新版界面可能叫 **消息推送**）→ **添加机器人**
 2. 复制它给出的 Webhook 地址，形如
    `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx`
+3. **不要勾选「加签 / 签名校验」** —— 脚本发送的是未签名请求，开启后推送会被拒
+
+> 个人可免费注册企业微信，群机器人 Webhook **不需要企业认证**；限流 20 条/分钟、无每日条数上限。
 
 **方案 2：Server酱（推送到个人微信）**
 
@@ -140,6 +143,8 @@ python refresh_token.py --gh-repo 你的用户名/workbuddy_auto_checkin
 ```
 
 脚本会解密并直接把 token 写进你仓库的 Secret，屏幕显示「已写入」即可跳到第 5 步。
+
+> 前提是 `gh` **已登录**（`gh auth status` 能看到账号）。仅安装而未登录时会写入失败，此时改用下方方式 B。
 
 **方式 B：没装 gh CLI —— 先打印出来，再手动粘贴**
 
@@ -202,7 +207,86 @@ python refresh_token.py
 | 已过期 | 🔴 访问令牌已过期，签到会失败，请立即重跑 `refresh_token.py` |
 
 > 因此**你不需要自己记日子**：只要 cron 在跑，临近到期时会连续多天收到黄色/红色提醒。
-> 收到提醒后在装有 WorkBuddy 的电脑上重跑一次导出脚本、覆盖 `WB_ACCESS_TOKEN` 即可。
+> 收到提醒后按 [令牌续期](#令牌续期) 的三步操作即可。
+
+## 令牌续期
+
+> 访问令牌有效期 30 天。收到 🟡 / 🔴 到期提醒后按本节操作，全程约 3 分钟。
+> **不需要改代码、不需要重新部署、不需要重启 workflow**；更新后的 Secret 在下一次运行自动生效。
+
+### 什么时候做
+
+| 推送里的提示 | 建议动作 |
+| --- | --- |
+| 🟡 剩 ≤ 7 天 | 任意一天完成续期（推荐，留足余量） |
+| 🔴 剩 ≤ 3 天 | 尽快完成 |
+| 已过期 / 日志出现「认证被拒」 | 立即完成 |
+
+### 第 1 步：在本机导出新令牌
+
+1. **先打开 WorkBuddy 客户端**并确认处于登录状态。客户端会自动换发新的 `accessToken`
+   并写回本机凭据文件；不先打开，可能导出到上一枚旧令牌。
+2. 在项目目录运行（macOS 用 `python3`；Windows 可用 `python` 或双击 `refresh_token.exe`）：
+
+   ```bash
+   cd ~/workbuddy_auto_checkin   # 换成你自己的克隆目录
+   python3 refresh_token.py
+   ```
+
+3. 输出结构如下（token 本体略去）：
+
+   ```text
+   凭据为加密信封，正在通过本机客户端解密…
+   ----- 以下为 token -----
+   eyJhbGciOiJSUzI1...（约 1500 字符，一整行）
+   ----- 以上为 token -----
+   [到期时间] YYYY-MM-DD HH:MM（剩余约 30.0 天）
+   ```
+
+4. **完整复制两个标记之间的整行**，不含标记、空格或换行。
+5. **自检**：`[到期时间]` 必须是「当天 + 约 30 天」。若仍是旧日期，说明客户端尚未换发，
+   退出并重开客户端后重试。
+
+### 第 2 步：在 GitHub 网页覆盖 Secret
+
+1. 打开 `https://github.com/OWNER/REPO/settings/secrets/actions`
+   （`OWNER/REPO` 换成你自己的仓库；也可走 仓库 → **Settings** → **Secrets and variables**
+   → **Actions** → **Secrets** 标签）
+2. 在列表找到 `WB_ACCESS_TOKEN`，点右侧 **Update**（编辑按钮）
+3. 在 **Value** 框**整体粘贴**新令牌 → 点 **Update secret**
+
+注意：
+
+- GitHub **不显示已有 Secret 的值**，只能整体覆盖，这是正常设计
+- **Name 保持 `WB_ACCESS_TOKEN` 不变**，不要新建、不要改名
+- **不要动推送通道的 Secret**（`WECOM_WEBHOOK` / `SERVERCHAN_SENDKEY` / `PUSHPLUS_TOKEN`）
+- 令牌等同登录态，请勿粘贴到聊天、截图、日志或公开仓库
+
+### 第 3 步：验证
+
+1. **Actions** → **Buddy 加油站每日自动化** → **Run workflow** → 绿色 **Run workflow**
+2. 日志中 `[令牌]` 行显示**新的到期日**、`overall_ok: true`，且微信收到消息 → 续期完成
+3. 若日志出现「认证被拒」，回到第 1 步重新导出一枚最新的令牌再覆盖一次
+
+### 两个边界情况
+
+- **每打开一次客户端，凭据文件里的令牌都可能被换发一次**。因此「导出 → 立刻覆盖 Secret」
+  建议一次做完，中间不要搁置太久。
+- **`refreshToken` 有效期 60 天**。约两个月后若脚本报「凭据文件缺少 accessToken」，
+  或 `[到期时间]` 不再前进，需要在 WorkBuddy 客户端**重新登录一次**，再按本节操作。
+
+### 可选：用命令行一步写入
+
+若本机 `gh` CLI **已登录**（`gh auth status` 能显示账号），可直接：
+
+```bash
+python3 refresh_token.py --gh-repo OWNER/REPO
+```
+
+Windows 用户对应 `refresh_token.exe --gh-repo OWNER/REPO`。
+
+> ⚠️ **`gh` 装了 ≠ 已登录**。脚本只检查 `gh` 命令是否存在，未登录时会写入失败并报错；
+> 此时改用上面的网页方式，或先执行 `gh auth login` 完成登录。
 
 ## 配置项
 
@@ -307,7 +391,7 @@ wps/                          WPS 金山文档版（脚本 + 说明，见 wps/RE
 
 ## 常见问题
 
-**令牌过期、或收到黄/红到期提醒** — token 由客户端签发，**有效期 30 天**（`expiresIn` = `2592000` 秒；`refreshToken` 为 60 天）。每次运行都会在推送里带一行到期状态，剩 7 天转黄、3 天转红，不必自己记日子。需要刷新时，在装有 WorkBuddy 的电脑上重跑 `python refresh_token.py --gh-repo OWNER/REPO` 覆盖即可（`OWNER/REPO` 换成你自己的仓库；Windows exe 同理：`refresh_token.exe --gh-repo OWNER/REPO`）。若日志出现「认证被拒」，同样适用。
+**令牌过期、或收到黄/红到期提醒** — token 有效期 30 天（`refreshToken` 60 天），每次运行的推送都会带一行到期状态，剩 7 天转黄、3 天转红，不必自己记日子。续期步骤见 [令牌续期](#令牌续期)：本机导出新令牌 → 在 GitHub 网页 **Update** `WB_ACCESS_TOKEN` → 手动跑一次验证。若本机 `gh` 已登录，也可用 `--gh-repo OWNER/REPO` 一步写入；**`gh` 只是装了、没登录时会失败**，此时走网页方式。日志出现「认证被拒」时同样适用。
 
 **fork 之后 Actions 页签是空的** — fork 来的仓库默认不启用 Actions。进 Actions 页签，点页面中间的 **I understand my workflows, go ahead and enable them** 启用一次即可。
 

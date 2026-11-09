@@ -207,10 +207,93 @@ python refresh_token.py
 | 已过期 | 🔴 访问令牌已过期，签到会失败，请立即重跑 `refresh_token.py` |
 
 > 因此**你不需要自己记日子**：只要 cron 在跑，临近到期时会连续多天收到黄色/红色提醒。
-> 收到提醒后按 [令牌续期](#令牌续期) 的三步操作即可。
+> 已启用 [自动令牌同步](#自动令牌同步) 的机器无需干预；未部署时按
+> [令牌续期](#令牌续期) 的三步操作即可。
+
+## 自动令牌同步
+
+> 配置一次后 **无需再手动续期**。下一节 [令牌续期](#令牌续期) 保留作兜底
+> （换电脑、定时任务未运行、客户端登录态失效时才用）。
+
+### 为什么必须在本机跑
+
+`accessToken` 由 WorkBuddy 客户端签发、以 Electron `safeStorage` 加密存在本机凭据文件中，
+GitHub Actions 的云端 runner 既读不到也解不开。因此续期动作必须有一段代码在本机执行，
+云端无法自举。
+
+### 机制
+
+`tools/token_sync.py` 每天做一次：
+
+1. 复用 `refresh_token.py` 的解密链路读出当前 `accessToken`
+2. 离线解析 JWT 的 `exp`，与 `~/.workbuddy/token_sync/state.json` 里上次同步的值比对
+3. 仅当客户端换发了新令牌（或距上次同步超过 20 天）时，通过 `gh secret set`
+   从 **stdin** 覆盖 Secret `WB_ACCESS_TOKEN`
+4. 明文 token 与 PAT **不落盘、不进命令行参数、不进日志**；`state.json` 只存到期时间
+
+客户端每次打开都可能换发一枚新的 30 天令牌，同步后云端 Secret 始终是最新的，
+正常情况下不会再出现 🟡 / 🔴 到期提醒。
+
+### 一次性配置（macOS）
+
+1. 创建**细粒度 PAT**：https://github.com/settings/personal-access-tokens
+   - **Repository access**：只选本仓库
+   - **Repository permissions**：`Secrets` → **Read and write**（写 Secret 必需；
+     `Contents` 不是必需项）
+   - 有效期选最长（GitHub 上限 1 年）
+2. 存到本机（脚本会检查权限，过宽则拒绝运行）：
+
+   ```bash
+   mkdir -p ~/.workbuddy/token_sync && chmod 700 ~/.workbuddy/token_sync
+   # 把 PAT 写入下列文件（一整行）
+   chmod 600 ~/.workbuddy/token_sync/gh_pat
+   ```
+
+3. 安装每日定时任务（模板里的 `__HOME__` 需替换成你的家目录）：
+
+   ```bash
+   sed "s#__HOME__#$HOME#g" tools/token_sync.plist.template \
+     > ~/Library/LaunchAgents/com.soulo.wb-token-sync.plist
+   launchctl load ~/Library/LaunchAgents/com.soulo.wb-token-sync.plist
+   ```
+
+   每天 09:00 执行，并在每次登录后补跑一次（覆盖关机期间错过的同步）。
+   脚本依赖 `gh` CLI（默认 `/opt/homebrew/bin/gh`），路径不同时改脚本里的 `GH` 常量。
+
+4. 验证：
+
+   ```bash
+   python3 tools/token_sync.py --dry-run   # 只解密并报告，不联网、不写任何东西
+   python3 tools/token_sync.py --force     # 强制写一次，确认 Secret 被更新
+   ```
+
+### 常用命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `python3 tools/token_sync.py` | 常规运行：仅在令牌更新时写 Secret |
+| `python3 tools/token_sync.py --force` | 强制覆盖一次 |
+| `python3 tools/token_sync.py --dry-run` | 只检查本机令牌，不联网 |
+| `cat ~/.workbuddy/token_sync/sync.log` | 查看同步历史（只含时间与结论） |
+| `launchctl unload ~/Library/LaunchAgents/com.soulo.wb-token-sync.plist` | 停用自动同步 |
+
+### 安全与边界
+
+- PAT **只授权单仓库的 Secrets 读写**，不要给其它权限、不要提交进仓库；
+  撤销入口：GitHub → Settings → Developer settings → Personal access tokens → Revoke
+- `~/.workbuddy/token_sync/` 为 700、`gh_pat` 为 600；PAT 与 token 都不出现在
+  命令行参数里（避免被 `ps` / shell 历史记录）
+- 更新 Secret **不会触发** workflow 运行，也不影响正在运行的任务；下一次 cron 自动生效
+- **电脑需偶尔开机**：launchd 在错过计划时间后会于唤醒时补跑，且令牌窗口有 30 天
+- **`refreshToken` 有效期 60 天**：若客户端不再换发新的 `accessToken`
+  （`[到期时间]` 不再前进），需在 WorkBuddy 客户端重新登录一次，再跑 `--force`
+- PAT 本身最长 1 年，到期前在 GitHub 重新生成并覆盖 `gh_pat` 即可
 
 ## 令牌续期
 
+> **本节是手动兜底流程。** 若已按 [自动令牌同步](#自动令牌同步) 部署本机定时任务，
+> 令牌会自动同步，无需执行本节。
+>
 > 访问令牌有效期 30 天。收到 🟡 / 🔴 到期提醒后按本节操作，全程约 3 分钟。
 > **不需要改代码、不需要重新部署、不需要重启 workflow**；更新后的 Secret 在下一次运行自动生效。
 
@@ -374,6 +457,8 @@ wb_auto.py                    云端执行主体：签到、领奖、派出、�
 refresh_token.py              本机一次性操作：导出 token / 写入 Secret（Windows + macOS）
 refresh_token.exe             上者的免 Python 打包版（Windows x64，双击即用）
 .github/workflows/daily.yml   cron 定义与执行步骤
+tools/token_sync.py           本机每日自动同步令牌到 Secret（见「自动令牌同步」）
+tools/token_sync.plist.template  macOS launchd 定时任务模板
 wps/                          WPS 金山文档版（脚本 + 说明，见 wps/README.md）
 ```
 
